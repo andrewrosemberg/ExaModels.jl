@@ -51,8 +51,19 @@ into an `ExaCore` with [`constraint`](@ref). The block is characterised by:
 - `gpu`: if `true`, callbacks receive device arrays (e.g. `CuArray`) directly — no CPU round-trip.
   Use this when your callbacks are already GPU-capable (CUDA kernels, CuDSS, etc.).
   Default is `false` (CPU bridge: arrays are `Array`-copied before every call).
+
+Optional direct product callbacks (bypass full matrix assembly in `jprod_nln!`,
+`jtprod_nln!`, `hprod!`).  When provided, these are O(n) per call instead of
+O(nnzj) or O(nnzh) for the sparse-assembly-then-SpMV fallback:
+
+- `jvp!`: `jvp!(Jv, x, v)` — writes `J(x) * v` into `Jv[1:ncon]`.
+  `x` and `v` are full `nvar`-dim vectors.
+- `vjp!`: `vjp!(Jtv, x, w)` — writes `J(x)ᵀ * w` into `Jtv[1:nvar]`.
+  `w` is the oracle's `ncon`-dim dual slice.
+- `hvp!`: `hvp!(Hv, x, y, v)` — writes `(Σᵢ yᵢ ∇²cᵢ(x)) * v` into `Hv[1:nvar]`.
+  `y` is the oracle's `ncon`-dim multiplier slice, `v` is full `nvar`-dim.
 """
-struct VectorNonlinearOracle{F, J, H, VT <: AbstractVector}
+struct VectorNonlinearOracle{F, J, H, VT <: AbstractVector, JVP, VJP, HVP}
     nvar::Int
     ncon::Int
     nnzj::Int
@@ -67,6 +78,9 @@ struct VectorNonlinearOracle{F, J, H, VT <: AbstractVector}
     jac!::J
     hess!::H
     gpu::Bool                # true ⟹ callbacks accept device arrays directly
+    jvp!::JVP               # nothing or (Jv, x, v) -> ...
+    vjp!::VJP               # nothing or (Jtv, x, w) -> ...
+    hvp!::HVP               # nothing or (Hv, x, y, v) -> ...
 end
 
 function VectorNonlinearOracle(;
@@ -84,6 +98,9 @@ function VectorNonlinearOracle(;
     jac!,
     hess! = (vals, x, y) -> nothing,
     gpu::Bool = false,
+    jvp! = nothing,
+    vjp! = nothing,
+    hvp! = nothing,
 )
     @assert length(jac_rows)  == nnzj "jac_rows length must equal nnzj"
     @assert length(jac_cols)  == nnzj "jac_cols length must equal nnzj"
@@ -97,6 +114,7 @@ function VectorNonlinearOracle(;
         hess_rows, hess_cols,
         lcon, ucon,
         f!, jac!, hess!, gpu,
+        jvp!, vjp!, hvp!,
     )
 end
 
@@ -106,6 +124,7 @@ Base.show(io::IO, o::VectorNonlinearOracle) = print(
 VectorNonlinearOracle
 
   ncon: $(o.ncon)   nnzj: $(o.nnzj)   nnzh: $(o.nnzh)   gpu: $(o.gpu)
+  jvp!: $(isnothing(o.jvp!) ? "sparse" : "direct")  vjp!: $(isnothing(o.vjp!) ? "sparse" : "direct")  hvp!: $(isnothing(o.hvp!) ? "sparse" : "direct")
 """,
 )
 
@@ -321,23 +340,37 @@ function jprod_nln!(
 )
     fill!(Jv, zero(eltype(Jv)))
     _jprod_nln!(m.cons, x, m.θ, v, Jv)
-    # Oracle part: CPU bridge unless oracle.gpu=true.
+    # Oracle part: use direct jvp! when available, otherwise sparse assembly.
     for (i, oracle) in enumerate(m.oracles)
-        off_c   = m.oracle_con_offsets[i]
-        xin     = _oracle_input(oracle, x)
-        vin     = oracle.gpu ? v : _ensure_cpu(v)
-        jac_buf = similar(xin, oracle.nnzj)
-        oracle.jac!(jac_buf, xin)
-        # Accumulate: always done on host to avoid scalar GPU indexing.
-        jac_host  = _ensure_cpu(jac_buf)
-        v_host    = _ensure_cpu(vin)
-        Jv_delta  = zeros(eltype(jac_host), length(Jv))
-        for k in 1:oracle.nnzj
-            Jv_delta[oracle.jac_rows[k] + off_c] += jac_host[k] * v_host[oracle.jac_cols[k]]
+        off_c = m.oracle_con_offsets[i]
+        if !isnothing(oracle.jvp!)
+            # Direct JVP path: O(ncon) instead of O(nnzj).
+            xin = _oracle_input(oracle, x)
+            vin = oracle.gpu ? v : _ensure_cpu(v)
+            if oracle.gpu
+                oracle.jvp!(view(Jv, off_c+1 : off_c+oracle.ncon), xin, vin)
+            else
+                Jv_local = similar(xin, oracle.ncon)
+                oracle.jvp!(Jv_local, xin, vin)
+                copyto!(view(Jv, off_c+1 : off_c+oracle.ncon), Jv_local)
+            end
+        else
+            # Sparse assembly fallback.
+            xin     = _oracle_input(oracle, x)
+            vin     = oracle.gpu ? v : _ensure_cpu(v)
+            jac_buf = similar(xin, oracle.nnzj)
+            oracle.jac!(jac_buf, xin)
+            # Accumulate: always done on host to avoid scalar GPU indexing.
+            jac_host  = _ensure_cpu(jac_buf)
+            v_host    = _ensure_cpu(vin)
+            Jv_delta  = zeros(eltype(jac_host), length(Jv))
+            for k in 1:oracle.nnzj
+                Jv_delta[oracle.jac_rows[k] + off_c] += jac_host[k] * v_host[oracle.jac_cols[k]]
+            end
+            Jv_buf = similar(Jv)
+            copyto!(Jv_buf, Jv_delta)
+            Jv .+= Jv_buf
         end
-        Jv_buf = similar(Jv)
-        copyto!(Jv_buf, Jv_delta)
-        Jv .+= Jv_buf
     end
     return Jv
 end
@@ -351,20 +384,42 @@ function jtprod_nln!(
     fill!(Jtv, zero(eltype(Jtv)))
     _jtprod_nln!(m.cons, x, m.θ, v, Jtv)
     for (i, oracle) in enumerate(m.oracles)
-        off_c   = m.oracle_con_offsets[i]
-        xin     = _oracle_input(oracle, x)
-        vin     = oracle.gpu ? v : _ensure_cpu(v)
-        jac_buf = similar(xin, oracle.nnzj)
-        oracle.jac!(jac_buf, xin)
-        jac_host  = _ensure_cpu(jac_buf)
-        v_host    = _ensure_cpu(vin)
-        Jtv_delta = zeros(eltype(jac_host), length(Jtv))
-        for k in 1:oracle.nnzj
-            Jtv_delta[oracle.jac_cols[k]] += jac_host[k] * v_host[oracle.jac_rows[k] + off_c]
+        off_c = m.oracle_con_offsets[i]
+        if !isnothing(oracle.vjp!)
+            # Direct VJP path: O(nvar) instead of O(nnzj).
+            xin = _oracle_input(oracle, x)
+            win = if oracle.gpu
+                view(v, off_c+1 : off_c+oracle.ncon)
+            else
+                view(_ensure_cpu(v), off_c+1 : off_c+oracle.ncon)
+            end
+            if oracle.gpu
+                Jtv_local = similar(x, oracle.nvar)
+                oracle.vjp!(Jtv_local, xin, win)
+                Jtv .+= Jtv_local
+            else
+                Jtv_local = similar(xin, oracle.nvar)
+                oracle.vjp!(Jtv_local, xin, win)
+                Jtv_buf = similar(Jtv)
+                copyto!(Jtv_buf, Jtv_local)
+                Jtv .+= Jtv_buf
+            end
+        else
+            # Sparse assembly fallback.
+            xin     = _oracle_input(oracle, x)
+            vin     = oracle.gpu ? v : _ensure_cpu(v)
+            jac_buf = similar(xin, oracle.nnzj)
+            oracle.jac!(jac_buf, xin)
+            jac_host  = _ensure_cpu(jac_buf)
+            v_host    = _ensure_cpu(vin)
+            Jtv_delta = zeros(eltype(jac_host), length(Jtv))
+            for k in 1:oracle.nnzj
+                Jtv_delta[oracle.jac_cols[k]] += jac_host[k] * v_host[oracle.jac_rows[k] + off_c]
+            end
+            Jtv_buf = similar(Jtv)
+            copyto!(Jtv_buf, Jtv_delta)
+            Jtv .+= Jtv_buf
         end
-        Jtv_buf = similar(Jtv)
-        copyto!(Jtv_buf, Jtv_delta)
-        Jtv .+= Jtv_buf
     end
     return Jtv
 end
@@ -435,33 +490,56 @@ function hprod!(
     _obj_hprod!(m.objs, x, m.θ, v, Hv, obj_weight)
     _con_hprod!(m.cons, x, m.θ, y, v, Hv, obj_weight)
     # Oracle Hessian-vector product.
-    # Accumulation is always done host-side (avoids scalar GPU indexing);
-    # the hess! call itself is on-device when oracle.gpu=true.
     for (i, oracle) in enumerate(m.oracles)
         off_c = m.oracle_con_offsets[i]
-        oracle.nnzh == 0 && continue
-        xin    = _oracle_input(oracle, x)
-        yslice = if oracle.gpu
-            view(y, (off_c+1):(off_c+oracle.ncon))
-        else
-            view(_ensure_cpu(y), (off_c+1):(off_c+oracle.ncon))
-        end
-        vin    = oracle.gpu ? v : _ensure_cpu(v)
-        hess_buf = similar(xin, oracle.nnzh)
-        oracle.hess!(hess_buf, xin, yslice)
-        hess_host = _ensure_cpu(hess_buf)
-        v_host    = _ensure_cpu(vin)
-        Hv_delta  = zeros(eltype(hess_host), length(Hv))
-        for k in 1:oracle.nnzh
-            r, c_ = oracle.hess_rows[k], oracle.hess_cols[k]
-            Hv_delta[r] += hess_host[k] * v_host[c_]
-            if r != c_
-                Hv_delta[c_] += hess_host[k] * v_host[r]
+        if !isnothing(oracle.hvp!)
+            # Direct HVP path: O(nvar) instead of O(nnzh).
+            # Works even when nnzh=0 (no sparse Hessian declared).
+            xin    = _oracle_input(oracle, x)
+            yslice = if oracle.gpu
+                view(y, (off_c+1):(off_c+oracle.ncon))
+            else
+                view(_ensure_cpu(y), (off_c+1):(off_c+oracle.ncon))
             end
+            vin = oracle.gpu ? v : _ensure_cpu(v)
+            if oracle.gpu
+                Hv_local = similar(x, oracle.nvar)
+                fill!(Hv_local, zero(eltype(Hv_local)))
+                oracle.hvp!(Hv_local, xin, yslice, vin)
+                Hv .+= Hv_local
+            else
+                Hv_local = zeros(eltype(xin), oracle.nvar)
+                oracle.hvp!(Hv_local, xin, yslice, vin)
+                Hv_buf = similar(Hv)
+                copyto!(Hv_buf, Hv_local)
+                Hv .+= Hv_buf
+            end
+        else
+            # Sparse assembly fallback.
+            oracle.nnzh == 0 && continue
+            xin    = _oracle_input(oracle, x)
+            yslice = if oracle.gpu
+                view(y, (off_c+1):(off_c+oracle.ncon))
+            else
+                view(_ensure_cpu(y), (off_c+1):(off_c+oracle.ncon))
+            end
+            vin    = oracle.gpu ? v : _ensure_cpu(v)
+            hess_buf = similar(xin, oracle.nnzh)
+            oracle.hess!(hess_buf, xin, yslice)
+            hess_host = _ensure_cpu(hess_buf)
+            v_host    = _ensure_cpu(vin)
+            Hv_delta  = zeros(eltype(hess_host), length(Hv))
+            for k in 1:oracle.nnzh
+                r, c_ = oracle.hess_rows[k], oracle.hess_cols[k]
+                Hv_delta[r] += hess_host[k] * v_host[c_]
+                if r != c_
+                    Hv_delta[c_] += hess_host[k] * v_host[r]
+                end
+            end
+            Hv_buf = similar(Hv)
+            copyto!(Hv_buf, Hv_delta)
+            Hv .+= Hv_buf
         end
-        Hv_buf = similar(Hv)
-        copyto!(Hv_buf, Hv_delta)
-        Hv .+= Hv_buf
     end
     return Hv
 end
