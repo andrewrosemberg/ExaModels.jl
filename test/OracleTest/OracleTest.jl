@@ -424,6 +424,97 @@ function test_gpu_oracle(backend)
     end
 end
 
+function test_direct_products(backend)
+    @testset "direct jvp!/vjp!/hvp! callbacks" begin
+        c = ExaCore(Float64; backend = backend)
+        x = variable(c, 4; lvar = -Inf, uvar = Inf, start = X0)
+        objective(c, x[i]^2 for i in 1:4)
+        constraint(c, x[1] + x[2]; lcon = 1.0, ucon = 1.0)
+
+        # Oracle A: linear, no product callbacks (sparse fallback)
+        oracle_A = VectorNonlinearOracle(
+            nvar = 4, ncon = 1, nnzj = 2, nnzh = 0,
+            jac_rows = [1, 1], jac_cols = [3, 4],
+            lcon = [0.0], ucon = [0.0],
+            f!   = (cv, xv) -> (cv[1] = xv[3] - xv[4]; nothing),
+            jac! = (vv, xv) -> (vv[1] = 1.0; vv[2] = -1.0; nothing),
+        )
+        constraint(c, oracle_A)
+
+        # Oracle B: nonlinear, WITH direct product callbacks
+        oracle_B = VectorNonlinearOracle(
+            nvar = 4, ncon = 1, nnzj = 2, nnzh = 2,
+            jac_rows = [1, 1], jac_cols = [3, 4],
+            hess_rows = [3, 4], hess_cols = [3, 4],
+            lcon = [-Inf], ucon = [Inf],
+            f!    = (cv, xv) -> (cv[1] = xv[3]^2 + xv[4]^2; nothing),
+            jac!  = (vv, xv) -> (vv[1] = 2*xv[3]; vv[2] = 2*xv[4]; nothing),
+            hess! = (hv, xv, yv) -> (hv[1] = 2*yv[1]; hv[2] = 2*yv[1]; nothing),
+            # Direct product callbacks
+            jvp!  = (Jv, xv, v) -> (Jv[1] = 2*xv[3]*v[3] + 2*xv[4]*v[4]; nothing),
+            vjp!  = (Jtv, xv, w) -> (fill!(Jtv, 0); Jtv[3] = 2*xv[3]*w[1]; Jtv[4] = 2*xv[4]*w[1]; nothing),
+            hvp!  = (Hv, xv, yv, v) -> (fill!(Hv, 0); Hv[3] = 2*yv[1]*v[3]; Hv[4] = 2*yv[1]*v[4]; nothing),
+        )
+        constraint(c, oracle_B)
+
+        m  = ExaModel(c; prod = true)
+        x0 = ExaModels.convert_array(X0, backend)
+        J  = analytic_jac_dense(X0)
+        vv = ExaModels.convert_array([1.0, -1.0, 2.0, -0.5], backend)
+        w  = ExaModels.convert_array([1.0, 2.0, -1.0], backend)
+        y0 = ExaModels.convert_array([0.0, 0.0, 1.0], backend)
+
+        Jv  = similar(x0, m.meta.ncon)
+        Jtw = similar(x0, m.meta.nvar)
+        Hv  = similar(x0, m.meta.nvar)
+
+        ExaModels.jprod_nln!(m, x0, vv, Jv)
+        @test Array(Jv) ≈ J * [1.0, -1.0, 2.0, -0.5] atol=1e-10
+
+        ExaModels.jtprod_nln!(m, x0, w, Jtw)
+        @test Array(Jtw) ≈ J' * [1.0, 2.0, -1.0] atol=1e-10
+
+        ExaModels.hprod!(m, x0, y0, vv, Hv)
+        H = analytic_hess_dense(X0, [0.0, 0.0, 1.0])
+        @test Array(Hv) ≈ H * [1.0, -1.0, 2.0, -0.5] atol=1e-10
+    end
+end
+
+function test_hvp_without_hess(backend)
+    @testset "hvp! without sparse hess" begin
+        c = ExaCore(Float64; backend = backend)
+        x = variable(c, 4; lvar = -Inf, uvar = Inf, start = X0)
+        objective(c, x[i]^2 for i in 1:4)
+        constraint(c, x[1] + x[2]; lcon = 1.0, ucon = 1.0)
+
+        # Oracle with nnzh=0 (no sparse Hessian), but hvp! provided
+        oracle = VectorNonlinearOracle(
+            nvar = 4, ncon = 1, nnzj = 2, nnzh = 0,
+            jac_rows = [1, 1], jac_cols = [3, 4],
+            lcon = [-Inf], ucon = [Inf],
+            f!    = (cv, xv) -> (cv[1] = xv[3]^2 + xv[4]^2; nothing),
+            jac!  = (vv, xv) -> (vv[1] = 2*xv[3]; vv[2] = 2*xv[4]; nothing),
+            # No hess! or hess_rows/hess_cols — but hvp! is given
+            hvp!  = (Hv, xv, yv, v) -> (fill!(Hv, 0); Hv[3] = 2*yv[1]*v[3]; Hv[4] = 2*yv[1]*v[4]; nothing),
+        )
+        constraint(c, oracle)
+
+        m  = ExaModel(c; prod = true)
+        x0 = ExaModels.convert_array(X0, backend)
+        y0 = ExaModels.convert_array([0.0, 1.0], backend)   # λ_oracle=1.0
+        vv = ExaModels.convert_array([1.0, -1.0, 2.0, -0.5], backend)
+
+        Hv = similar(x0, m.meta.nvar)
+        ExaModels.hprod!(m, x0, y0, vv, Hv)
+
+        # Expected: obj Hessian (2I)*v + oracle HVP
+        # obj:    2*[1,-1,2,-0.5] = [2,-2,4,-1]
+        # oracle: 2*1.0*[0,0,2,-0.5] = [0,0,4,-1]
+        # total:  [2,-2,8,-2]
+        @test Array(Hv) ≈ [2.0, -2.0, 8.0, -2.0] atol=1e-10
+    end
+end
+
 function runtests()
     @testset "OracleTest" begin
         @testset "VectorNonlinearOracle type checks" begin
@@ -441,6 +532,8 @@ function runtests()
                 test_hprod(backend)
                 test_multiple_oracles(backend)
                 test_gpu_oracle(backend)
+                test_direct_products(backend)
+                test_hvp_without_hess(backend)
             end
         end
     end

@@ -915,33 +915,47 @@ function ExaModels.jprod_nln!(
             ndrange = _n,
         )
     end
-    # Oracle part: gpu=true → write directly into jacbuffer slice, use precomputed sparsity.
+    # Oracle part: use direct jvp! when available, otherwise sparse assembly.
     for (i, oracle) in enumerate(m.oracles)
         off_j = m.oracle_jac_offsets[i]
         off_c = m.oracle_con_offsets[i]
-        oracle.nnzj == 0 && continue
         xin = ExaModels._oracle_input(oracle, x)
-        if oracle.gpu
-            cache = m.ext.prodhelper.oracle_prod[i]
-            oracle.jac!(view(m.ext.prodhelper.jacbuffer, off_j+1 : off_j+oracle.nnzj), xin)
-            let _n = length(cache.jacptri) - 1
-                _n > 0 && kerspmv(m.ext.backend)(
-                    Jv, v, cache.jacsparsityi, m.ext.prodhelper.jacbuffer, cache.jacptri;
-                    ndrange = _n,
-                )
+        if !isnothing(oracle.jvp!)
+            # Direct JVP path.
+            if oracle.gpu
+                oracle.jvp!(view(Jv, off_c+1 : off_c+oracle.ncon), xin, v)
+            else
+                v_cpu = Array(v)
+                Jv_cpu = zeros(T, oracle.ncon)
+                oracle.jvp!(Jv_cpu, xin, v_cpu)
+                buf = similar(Jv, oracle.ncon)
+                copyto!(buf, Jv_cpu)
+                view(Jv, off_c+1 : off_c+oracle.ncon) .+= buf
             end
         else
-            jac_buf  = similar(xin, oracle.nnzj)
-            oracle.jac!(jac_buf, xin)
-            jac_host = Array(jac_buf)
-            v_host   = Array(v)
-            delta    = zeros(T, length(Jv))
-            for k in 1:oracle.nnzj
-                delta[oracle.jac_rows[k] + off_c] += jac_host[k] * v_host[oracle.jac_cols[k]]
+            oracle.nnzj == 0 && continue
+            if oracle.gpu
+                cache = m.ext.prodhelper.oracle_prod[i]
+                oracle.jac!(view(m.ext.prodhelper.jacbuffer, off_j+1 : off_j+oracle.nnzj), xin)
+                let _n = length(cache.jacptri) - 1
+                    _n > 0 && kerspmv(m.ext.backend)(
+                        Jv, v, cache.jacsparsityi, m.ext.prodhelper.jacbuffer, cache.jacptri;
+                        ndrange = _n,
+                    )
+                end
+            else
+                jac_buf  = similar(xin, oracle.nnzj)
+                oracle.jac!(jac_buf, xin)
+                jac_host = Array(jac_buf)
+                v_host   = Array(v)
+                delta    = zeros(T, length(Jv))
+                for k in 1:oracle.nnzj
+                    delta[oracle.jac_rows[k] + off_c] += jac_host[k] * v_host[oracle.jac_cols[k]]
+                end
+                buf = similar(Jv)
+                copyto!(buf, delta)
+                Jv .+= buf
             end
-            buf = similar(Jv)
-            copyto!(buf, delta)
-            Jv .+= buf
         end
     end
     return Jv
@@ -966,33 +980,49 @@ function ExaModels.jtprod_nln!(
             ndrange = _n,
         )
     end
-    # Oracle part: gpu=true → write directly into jacbuffer slice, use precomputed sparsity.
+    # Oracle part: use direct vjp! when available, otherwise sparse assembly.
     for (i, oracle) in enumerate(m.oracles)
         off_j = m.oracle_jac_offsets[i]
         off_c = m.oracle_con_offsets[i]
-        oracle.nnzj == 0 && continue
         xin = ExaModels._oracle_input(oracle, x)
-        if oracle.gpu
-            cache = m.ext.prodhelper.oracle_prod[i]
-            oracle.jac!(view(m.ext.prodhelper.jacbuffer, off_j+1 : off_j+oracle.nnzj), xin)
-            let _n = length(cache.jacptrj) - 1
-                _n > 0 && kerspmv2(m.ext.backend)(
-                    Jtv, v, cache.jacsparsityj, m.ext.prodhelper.jacbuffer, cache.jacptrj;
-                    ndrange = _n,
-                )
+        if !isnothing(oracle.vjp!)
+            # Direct VJP path.
+            if oracle.gpu
+                Jtv_local = similar(x, oracle.nvar)
+                oracle.vjp!(Jtv_local, xin, view(v, off_c+1 : off_c+oracle.ncon))
+                Jtv .+= Jtv_local
+            else
+                w_cpu = Array(view(v, off_c+1 : off_c+oracle.ncon))
+                Jtv_cpu = zeros(T, oracle.nvar)
+                oracle.vjp!(Jtv_cpu, xin, w_cpu)
+                buf = similar(Jtv)
+                copyto!(buf, Jtv_cpu)
+                Jtv .+= buf
             end
         else
-            jac_buf  = similar(xin, oracle.nnzj)
-            oracle.jac!(jac_buf, xin)
-            jac_host = Array(jac_buf)
-            v_host   = Array(v)
-            delta    = zeros(T, length(Jtv))
-            for k in 1:oracle.nnzj
-                delta[oracle.jac_cols[k]] += jac_host[k] * v_host[oracle.jac_rows[k] + off_c]
+            oracle.nnzj == 0 && continue
+            if oracle.gpu
+                cache = m.ext.prodhelper.oracle_prod[i]
+                oracle.jac!(view(m.ext.prodhelper.jacbuffer, off_j+1 : off_j+oracle.nnzj), xin)
+                let _n = length(cache.jacptrj) - 1
+                    _n > 0 && kerspmv2(m.ext.backend)(
+                        Jtv, v, cache.jacsparsityj, m.ext.prodhelper.jacbuffer, cache.jacptrj;
+                        ndrange = _n,
+                    )
+                end
+            else
+                jac_buf  = similar(xin, oracle.nnzj)
+                oracle.jac!(jac_buf, xin)
+                jac_host = Array(jac_buf)
+                v_host   = Array(v)
+                delta    = zeros(T, length(Jtv))
+                for k in 1:oracle.nnzj
+                    delta[oracle.jac_cols[k]] += jac_host[k] * v_host[oracle.jac_rows[k] + off_c]
+                end
+                buf = similar(Jtv)
+                copyto!(buf, delta)
+                Jtv .+= buf
             end
-            buf = similar(Jtv)
-            copyto!(buf, delta)
-            Jtv .+= buf
         end
     end
     return Jtv
@@ -1029,43 +1059,62 @@ function ExaModels.hprod!(
             ndrange = _n,
         )
     end
-    # Oracle part: gpu=true → write directly into hessbuffer slice, use precomputed sparsity.
+    # Oracle part: use direct hvp! when available, otherwise sparse assembly.
     for (i, oracle) in enumerate(m.oracles)
         off_h = m.oracle_hess_offsets[i]
         off_c = m.oracle_con_offsets[i]
-        oracle.nnzh == 0 && continue
         xin = ExaModels._oracle_input(oracle, x)
-        if oracle.gpu
-            cache  = m.ext.prodhelper.oracle_prod[i]
-            oracle.hess!(view(m.ext.prodhelper.hessbuffer, off_h+1 : off_h+oracle.nnzh),
-                         xin, view(y, off_c+1 : off_c+oracle.ncon))
-            let _n = length(cache.hessptri) - 1
-                _n > 0 && kersyspmv(m.ext.backend)(
-                    Hv, v, cache.hesssparsityi, m.ext.prodhelper.hessbuffer, cache.hessptri;
-                    ndrange = _n,
-                )
-            end
-            let _n = length(cache.hessptrj) - 1
-                _n > 0 && kersyspmv2(m.ext.backend)(
-                    Hv, v, cache.hesssparsityj, m.ext.prodhelper.hessbuffer, cache.hessptrj;
-                    ndrange = _n,
-                )
+        if !isnothing(oracle.hvp!)
+            # Direct HVP path.  Works even when nnzh=0.
+            if oracle.gpu
+                Hv_local = similar(x, oracle.nvar)
+                fill!(Hv_local, zero(eltype(Hv_local)))
+                oracle.hvp!(Hv_local, xin,
+                            view(y, off_c+1 : off_c+oracle.ncon), v)
+                Hv .+= Hv_local
+            else
+                yslice = Array(view(y, off_c+1 : off_c+oracle.ncon))
+                v_cpu  = Array(v)
+                Hv_cpu = zeros(T, oracle.nvar)
+                oracle.hvp!(Hv_cpu, xin, yslice, v_cpu)
+                buf = similar(Hv)
+                copyto!(buf, Hv_cpu)
+                Hv .+= buf
             end
         else
-            yslice   = view(Array(y), off_c+1 : off_c+oracle.ncon)
-            hess_buf = similar(xin, oracle.nnzh)
-            oracle.hess!(hess_buf, xin, yslice)
-            h_host = Array(hess_buf)
-            v_host = Array(v)
-            delta  = zeros(T, length(Hv))
-            for k in 1:oracle.nnzh
-                r, c_ = oracle.hess_rows[k], oracle.hess_cols[k]
-                delta[r] += h_host[k] * v_host[c_]
-                r != c_ && (delta[c_] += h_host[k] * v_host[r])
+            oracle.nnzh == 0 && continue
+            if oracle.gpu
+                cache  = m.ext.prodhelper.oracle_prod[i]
+                oracle.hess!(view(m.ext.prodhelper.hessbuffer, off_h+1 : off_h+oracle.nnzh),
+                             xin, view(y, off_c+1 : off_c+oracle.ncon))
+                let _n = length(cache.hessptri) - 1
+                    _n > 0 && kersyspmv(m.ext.backend)(
+                        Hv, v, cache.hesssparsityi, m.ext.prodhelper.hessbuffer, cache.hessptri;
+                        ndrange = _n,
+                    )
+                end
+                let _n = length(cache.hessptrj) - 1
+                    _n > 0 && kersyspmv2(m.ext.backend)(
+                        Hv, v, cache.hesssparsityj, m.ext.prodhelper.hessbuffer, cache.hessptrj;
+                        ndrange = _n,
+                    )
+                end
+            else
+                yslice   = view(Array(y), off_c+1 : off_c+oracle.ncon)
+                hess_buf = similar(xin, oracle.nnzh)
+                oracle.hess!(hess_buf, xin, yslice)
+                h_host = Array(hess_buf)
+                v_host = Array(v)
+                delta  = zeros(T, length(Hv))
+                for k in 1:oracle.nnzh
+                    r, c_ = oracle.hess_rows[k], oracle.hess_cols[k]
+                    delta[r] += h_host[k] * v_host[c_]
+                    r != c_ && (delta[c_] += h_host[k] * v_host[r])
+                end
+                buf = similar(Hv)
+                copyto!(buf, delta)
+                Hv .+= buf
             end
-            buf = similar(Hv)
-            copyto!(buf, delta)
-            Hv .+= buf
         end
     end
     return Hv
